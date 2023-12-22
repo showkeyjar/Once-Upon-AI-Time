@@ -1,11 +1,9 @@
 import os
 import glob
-import json
-# import logging
+import logging
 import pandas as pd
 from docx import Document
 from docx.shared import Inches
-from loguru import logger
 # https://cloud.tencent.com/developer/article/1763991
 from xpinyin import Pinyin
 from utils import prompts, gpt3, stable_diffusion, doc, sqlite
@@ -15,38 +13,13 @@ pip install python-docx
 todo 仍有机器人的不恰当的回答未过滤, 详见 [元]潘纯_2023-12-15.docx
 todo 单句生成的图片和整体理解的意思不对应
 2023-12-16 由于图像生成过于随意, 将逐句生成改为整首诗生成
-todo 汉、唐、宋、明、魏晋 可以尝试使用 lora hanfu_v30 (发现在prompt中增加lora标签无效)
-2023-12-22 增加进度记录和断点继续
 """
-# logging.root.setLevel(logging.NOTSET)
-# logging.basicConfig(format="%(thread)d %(asctime)s %(name)s:%(levelname)s:%(lineno)d:%(message)s",
-#                     datefmt="%Y-%m-%d %H:%M:%S", level=logging.DEBUG)
-# logger = logging.getLogger(__name__)
-logger.add("logs/main.log", rotation="50 MB")
-# todo 使用了lora后, 效果反而变差, 检查原因
-lora_styles = {"唐": ", tang style, <lora:hanfu_v30:1>"}
+logging.root.setLevel(logging.NOTSET)
+logging.basicConfig(format="%(thread)d %(asctime)s %(name)s:%(levelname)s:%(lineno)d:%(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S", level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
 has_gen_author = False
-progress_record = {"book_idx": 0, "author_idx": 0, "poem_idx": 0, "part_idx": 0}
-
-
-def load_progress():
-    """
-    加载进度
-    """
-    global progress_record
-    if os.path.exists("progress.json"):
-        with open("progress.json", "r", encoding="utf-8") as f:
-            progress_record = json.load(f)
-    return progress_record
-
-
-def save_progress():
-    """
-    保存进度
-    """
-    global progress_record
-    with open("progress.json", "w", encoding="utf-8") as f:
-        json.dump(progress_record, f, ensure_ascii=False, indent=4)
 
 
 def read_data():
@@ -140,7 +113,6 @@ def gen_author(se, document, title, content):
     """
     生成作者信息(单独做成1页)
     """
-    global lora_styles
     chinese_dynasty = str(se['朝代'])
     try:
         dynasty_prompt = prompts.dynasty_translation(chinese_dynasty)
@@ -149,7 +121,7 @@ def gen_author(se, document, title, content):
         if dynasty==chinese_dynasty:
             p = Pinyin()
             dynasty = p.get_pinyin(chinese_dynasty)
-        logger.debug("translate dynasty: " + dynasty)
+        print("translate dynasty:", dynasty)
     except Exception as e:
         logger.exception(e)
 
@@ -161,7 +133,7 @@ def gen_author(se, document, title, content):
         if author==chinese_author:
             p = Pinyin()
             author = p.get_pinyin(chinese_author, tone_marks='marks')
-        logger.debug("translate author: " + author)
+        print("translate author:", author)
     except Exception as e:
         logger.exception(e)
 
@@ -179,9 +151,7 @@ def gen_author(se, document, title, content):
         portrait_prompt = prompts.author_profile(title, dynasty, author, gender, content)
         portrait = gpt3.generate_with_prompt(portrait_prompt, 0.6)
         portrait = get_first_result(portrait, text_in_symbol='"', default_value=portrait)
-        # 增加lora调用
-        portrait += lora_styles[chinese_dynasty]
-        logger.debug("author profile: " + portrait)
+        print("author profile:", portrait)
         author_image = gen_image(portrait)
     except Exception as e:
         logger.exception(e)
@@ -207,13 +177,13 @@ def gen_author(se, document, title, content):
 
 
 def gen_story(se, document, author=None, doc_name=None):
-    global has_gen_author, progress_record
+    global has_gen_author
     chinese_title = str(se['题目'])
     try:
         title_prompt = prompts.title_translation(chinese_title)
         title = gpt3.generate_with_prompt(title_prompt, 0.6)
         title = get_first_result(title, text_in_symbol='"', default_value=title)
-        logger.debug("translate title: " + title)
+        print("translate title:", title)
     except Exception as e:
         logger.exception(e)
         return False
@@ -223,55 +193,69 @@ def gen_story(se, document, author=None, doc_name=None):
         content_prompt = prompts.poem_translation(chinese_content)
         content = gpt3.generate_with_prompt(content_prompt, 0.6)
         content = get_first_result(content, text_in_symbol='"', default_value=content)
-        logger.debug("translate content: " + content)
+        print("translate content:", content)
     except Exception as e:
         logger.exception(e)
     
     poem_pics = []
     # 如果是某位作者的专辑, 则只需要生成1次作者简介
     if not has_gen_author:
-        author_image = gen_author(se, document, title, content)
+        author_image = gen_author(se, document, author, content)
         if author_image is not None:
             poem_pics = [author_image]
         if author is not None:
             has_gen_author = True
 
-    if doc_name is not None and progress_record['part_idx']<1:
+    if doc_name is not None:
         document.save(doc_name)
-        progress_record['part_idx'] = 1
-        save_progress()
+
+    lines = get_llm_lines(chinese_content)
+    # todo 中英文还不对应, 需要检查
+    en_lines = get_llm_lines(content, [";", "."])
 
     document.add_heading(chinese_title, 1)
     document.add_heading(title, 2)
 
-    table = document.add_table(rows=1, cols=2)
+    table = document.add_table(rows=len(lines), cols=2)
 
-    try:
-        poem_view_prompt = prompts.poem_view(content)
-        poem_view = gpt3.generate_with_prompt(poem_view_prompt, 0.6)
-        poem_view = get_first_result(poem_view, text_in_symbol='"', default_value=poem_view)
-        logger.debug("poem view: " + poem_view)
-    except Exception as e:
-        logger.exception(e)
+    switch_col = False
+    for i, line in enumerate(lines):
+        row_cells = table.rows[i].cells
+        if switch_col:
+            text_col = 1
+            pic_col = 0
+            switch_col = False
+        else:
+            text_col = 0
+            pic_col = 1
+            switch_col = True
+        row_cells[text_col].paragraphs[0].text = line
+        # 由于中英文始终对应不上, 所以这里暂时做成一句句翻译, 事实上整体翻译效果会好
+        if len(en_lines)==len(lines):
+            en_line = en_lines[i]
+        else:
+            try:
+                line_prompt = prompts.line_translation(line)
+                en_line = gpt3.generate_with_prompt(line_prompt, 0.6)
+                en_line = get_first_result(en_line, text_in_symbol='"', default_value=en_line)
+                print("translate line:", en_line)
+            except Exception as e:
+                logger.exception(e)
 
-    image_url = gen_image(poem_view)
-    if image_url is not None:
-        try:
-            paragraph = table.rows[0].cells[0].paragraphs[0]
-            run = paragraph.add_run()
-            run.add_picture(image_url, width=Inches(3), height=Inches(3))
-            poem_pics.append(image_url)
-            doc.set_cell_margins(table.rows[0].cells[0], top=0, start=0, bottom=0, end=0)
-        except Exception as e:
-            logger.exception(e)
-
-    table.rows[0].cells[1].paragraphs[0].text = chinese_content
-    table.rows[0].cells[1].add_paragraph(content)
-
-    if doc_name is not None and progress_record['part_idx']<2:
+        row_cells[text_col].add_paragraph(en_line)
+        # 这里使用英文诗句生成提示词会更恰当
+        image_url = gen_image(en_line)
+        if image_url is not None:
+            try:
+                paragraph = row_cells[pic_col].paragraphs[0]
+                run = paragraph.add_run()
+                run.add_picture(image_url, width=Inches(3), height=Inches(3))
+                poem_pics.append(image_url)
+                doc.set_cell_margins(row_cells[pic_col], top=0, start=0, bottom=0, end=0)
+            except Exception as e:
+                logger.exception(e)
+    if doc_name is not None:
         document.save(doc_name)
-        progress_record['part_idx'] = 2
-        save_progress()
     for p in poem_pics:
         try:
             os.remove(p)
@@ -282,7 +266,8 @@ def gen_story(se, document, author=None, doc_name=None):
     try:
         interpret_prompt = prompts.poem_interpret(chinese_content)
         interpret = gpt3.generate_with_prompt(interpret_prompt, 0.6)
-        logger.debug("interpret content: " + interpret)
+        interpret = get_first_result(interpret, text_in_symbol='"', default_value=interpret)
+        print("interpret content:", interpret)
     except Exception as e:
         logger.exception(e)
     document.add_paragraph(interpret)
@@ -292,71 +277,49 @@ def gen_story(se, document, author=None, doc_name=None):
         story_prompt = prompts.poem_associate_story(chinese_content)
         story = gpt3.generate_with_prompt(story_prompt, 0.6)
         # 故事不能用""过滤
-        logger.debug("associate story: " + story)
+        print("associate story:", story)
     except Exception as e:
         logger.exception(e)
     document.add_paragraph(story)
     document.add_page_break()
-    if doc_name is not None and progress_record['part_idx']<3:
+    if doc_name is not None:
         document.save(doc_name)
-        progress_record['part_idx'] = 3
-        save_progress()
 
 
 def gen_one_book(df_story, book, author):
     """
     生成一本书, 生成根据作者分成多本
     """
-    global progress_record
     book_name = book.split("/")[-1].split("\\")[-1].split(".")[0]
     doc_name = 'output/[' + book_name + ']' + author + '.docx'
     document = Document()
     # 为了谨慎使用接口, 以及方便对author信息输出做控制, 这里使用for循环
     for index, row in df_story.iterrows():
-        if index < progress_record["poem_idx"]:
-            continue
         gen_story(row, document, author, doc_name)
-        progress_record["poem_idx"] = progress_record["poem_idx"] + 1
-        progress_record["part_idx"] = 0
-        save_progress()
         # df_story.apply(gen_story, axis=1, document=document, author=author)
     # document.save(doc_name)
-    progress_record['author_idx'] = progress_record['author_idx'] + 1
-    progress_record['poem_idx'] = 0
-    progress_record['part_idx'] = 0
-    save_progress()
     logger.debug("book " + doc_name + " generated")
 
 
 if __name__ == "__main__":
-    load_progress()
-    # books = read_data()
-    book = "input/唐.csv"
-    df_story = pd.read_csv(book)
-    author = "李白"
-    df_author = df_story[df_story['作者']==author]
-    gen_one_book(df_author, book, author)
-    progress_record['book_idx'] = progress_record['book_idx'] + 1
-    progress_record['author_idx'] = 0
-    progress_record["poem_idx"] = 0
-    progress_record['part_idx'] = 0
-    save_progress()
-    # for b_index, book in enumerate(books):
-        # df_story = pd.read_csv(book)
-        # authors = df_story['作者'].unique().tolist()
-        # authors.sort()
-        # 2023-12-13 由于目测某些作者写作内容较多, 大于10篇的按作者划分, 不够的作者综合成1篇
-        # list_other = []
-        # for i, author in enumerate(authors):
-        #     has_gen_author = False
-        #     df_author = df_story[df_story['作者'] == author]
-        #     if len(df_author) >= 10:
-        #         gen_one_book(df_author, book, author)
-        #         logger.debug("author(" + str(i) + ") " + author + " generated")
-        #     else:
-        #         list_other.append(df_author)
-        # if len(list_other) > 0:
-        #     df_other = pd.concat(list_other)
-        #     has_gen_author = False
-        #     gen_one_book(df_other, book, "其他")
-        # logger.debug("book(" + str(b_index) + ") " + book + " generated")
+    books = read_data()
+    # for book in books:
+    #     df_story = pd.read_csv(book)
+    #     gen_one_book(df_story, book)
+    df_story = pd.read_csv(books[0])
+    authors = df_story['作者'].unique()
+    # 2023-12-13 由于目测某些作者写作内容较多, 大于20篇的按作者划分, 不够的作者综合成1篇
+    list_other = []
+    # 测试前3个
+    for author in authors[:1]:
+        has_gen_author = False
+        df_author = df_story[df_story['作者'] == author]
+        if len(df_author) >= 20:
+            gen_one_book(df_author, books[0], author)
+        else:
+            list_other.append(df_author)
+    if len(list_other) > 0:
+        df_other = pd.concat(list_other)
+        has_gen_author = False
+        gen_one_book(df_other, books[0], "其他")
+
